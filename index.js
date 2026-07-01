@@ -1,4 +1,5 @@
 import "dotenv/config";
+import fs from "fs";
 import {
   Client,
   GatewayIntentBits,
@@ -11,80 +12,85 @@ import {
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;
 const guildId = process.env.GUILD_ID;
+const dbPath = process.env.DB_PATH || "./ash-data.json";
 
 if (!token || !clientId || !guildId) {
   console.error("Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID.");
   process.exit(1);
 }
 
+function loadDb() {
+  if (!fs.existsSync(dbPath)) {
+    return { mode: "approval", members: {}, usedCodes: [] };
+  }
+  return JSON.parse(fs.readFileSync(dbPath, "utf8"));
+}
+
+function saveDb() {
+  fs.writeFileSync(dbPath, JSON.stringify(db, null, 2));
+}
+
+const db = loadDb();
+
 const commands = [
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Check if the ASH bot is online."),
+  new SlashCommandBuilder().setName("ping").setDescription("Check if the ASH bot is online."),
 
   new SlashCommandBuilder()
     .setName("ashmode")
     .setDescription("Set ASH gift-code mode.")
-    .addStringOption(option =>
-      option
-        .setName("mode")
-        .setDescription("approval or auto")
-        .setRequired(true)
-        .addChoices(
-          { name: "Approval", value: "approval" },
-          { name: "Auto", value: "auto" }
-        )
-    )
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
-  new SlashCommandBuilder()
-    .setName("usecode")
-    .setDescription("Submit a Kingshot gift code.")
-    .addStringOption(option =>
-      option
-        .setName("code")
-        .setDescription("Gift code")
-        .setRequired(true)
+    .addStringOption(o =>
+      o.setName("mode").setDescription("approval or auto").setRequired(true)
+        .addChoices({ name: "Approval", value: "approval" }, { name: "Auto", value: "auto" })
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("register")
-    .setDescription("Register your Kingshot FID.")
-    .addStringOption(option =>
-      option
-        .setName("fid")
-        .setDescription("Your Kingshot FID / Player ID")
-        .setRequired(true)
-    )
-    .addStringOption(option =>
-      option
-        .setName("name")
-        .setDescription("Your in-game name")
-        .setRequired(false)
-    )
-].map(command => command.toJSON());
+    .setDescription("Register one of your Kingshot FIDs.")
+    .addStringOption(o => o.setName("fid").setDescription("Kingshot FID / Player ID").setRequired(true))
+    .addStringOption(o => o.setName("name").setDescription("In-game name for this FID").setRequired(false)),
 
-let ashMode = "approval";
-const members = new Map();
-const usedCodes = new Set();
+  new SlashCommandBuilder()
+    .setName("myids")
+    .setDescription("Show your registered Kingshot FIDs."),
+
+  new SlashCommandBuilder()
+    .setName("removefid")
+    .setDescription("Remove one of your registered Kingshot FIDs.")
+    .addStringOption(o => o.setName("fid").setDescription("FID to remove").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("members")
+    .setDescription("Show how many FIDs are registered.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("usecode")
+    .setDescription("Submit a Kingshot gift code.")
+    .addStringOption(o => o.setName("code").setDescription("Gift code").setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(token);
 
 async function registerCommands() {
-  await rest.put(
-    Routes.applicationGuildCommands(clientId, guildId),
-    { body: commands }
-  );
+  await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: commands });
   console.log("Slash commands registered.");
 }
 
+function getAllFids() {
+  return Object.values(db.members).flatMap(member =>
+    member.fids.map(f => ({
+      discordId: member.discordId,
+      discordName: member.discordName,
+      fid: f.fid,
+      name: f.name
+    }))
+  );
+}
+
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
 client.once("ready", () => {
@@ -95,42 +101,94 @@ client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "ping") {
-    await interaction.reply("ASH bot is online.");
+    return interaction.reply("ASH bot is online.");
   }
 
   if (interaction.commandName === "ashmode") {
-    ashMode = interaction.options.getString("mode");
-    await interaction.reply(`ASH gift-code mode set to **${ashMode}**.`);
+    db.mode = interaction.options.getString("mode");
+    saveDb();
+    return interaction.reply(`ASH gift-code mode set to **${db.mode}**.`);
   }
 
   if (interaction.commandName === "register") {
-    const fid = interaction.options.getString("fid");
+    const fid = interaction.options.getString("fid").trim();
     const name = interaction.options.getString("name") || interaction.user.username;
 
-    members.set(interaction.user.id, {
-      fid,
-      name,
-      discord: interaction.user.username
-    });
+    if (!/^\d{4,20}$/.test(fid)) {
+      return interaction.reply({ content: "That FID does not look valid. Use numbers only.", ephemeral: true });
+    }
 
-    await interaction.reply({
-      content: `Registered **${name}** with FID **${fid}**.`,
-      ephemeral: true
-    });
+    if (!db.members[interaction.user.id]) {
+      db.members[interaction.user.id] = {
+        discordId: interaction.user.id,
+        discordName: interaction.user.username,
+        fids: []
+      };
+    }
+
+    const existing = db.members[interaction.user.id].fids.find(x => x.fid === fid);
+    if (existing) {
+      existing.name = name;
+      saveDb();
+      return interaction.reply({ content: `Updated FID **${fid}** as **${name}**.`, ephemeral: true });
+    }
+
+    db.members[interaction.user.id].fids.push({ fid, name, addedAt: new Date().toISOString() });
+    saveDb();
+
+    return interaction.reply({ content: `Registered **${name}** with FID **${fid}**.`, ephemeral: true });
+  }
+
+  if (interaction.commandName === "myids") {
+    const member = db.members[interaction.user.id];
+
+    if (!member || member.fids.length === 0) {
+      return interaction.reply({ content: "You have no FIDs registered.", ephemeral: true });
+    }
+
+    const list = member.fids.map((x, i) => `${i + 1}. **${x.name}** — \`${x.fid}\``).join("\n");
+    return interaction.reply({ content: `Your registered FIDs:\n${list}`, ephemeral: true });
+  }
+
+  if (interaction.commandName === "removefid") {
+    const fid = interaction.options.getString("fid").trim();
+    const member = db.members[interaction.user.id];
+
+    if (!member) {
+      return interaction.reply({ content: "You have no FIDs registered.", ephemeral: true });
+    }
+
+    const before = member.fids.length;
+    member.fids = member.fids.filter(x => x.fid !== fid);
+    saveDb();
+
+    if (member.fids.length === before) {
+      return interaction.reply({ content: `FID **${fid}** was not found on your account.`, ephemeral: true });
+    }
+
+    return interaction.reply({ content: `Removed FID **${fid}**.`, ephemeral: true });
+  }
+
+  if (interaction.commandName === "members") {
+    const users = Object.keys(db.members).length;
+    const fids = getAllFids().length;
+    return interaction.reply(`ASH registry: **${users}** Discord members, **${fids}** total FIDs.`);
   }
 
   if (interaction.commandName === "usecode") {
-    const code = interaction.options.getString("code").toUpperCase();
+    const code = interaction.options.getString("code").trim().toUpperCase();
 
-    if (usedCodes.has(code)) {
-      await interaction.reply(`Code **${code}** has already been submitted.`);
-      return;
+    if (db.usedCodes.includes(code)) {
+      return interaction.reply(`Code **${code}** has already been submitted.`);
     }
 
-    usedCodes.add(code);
+    db.usedCodes.push(code);
+    saveDb();
 
-    await interaction.reply(
-      `ASH code received: **${code}**\nMode: **${ashMode}**\nRegistered FIDs: **${members.size}**\n\nReal Kingshot redemption will be connected after the Discord side is tested.`
+    const fids = getAllFids();
+
+    return interaction.reply(
+      `🎁 ASH code received: **${code}**\nMode: **${db.mode}**\nRegistered FIDs: **${fids.length}**\n\nNext step: connect the real Kingshot redemption worker.`
     );
   }
 });
@@ -142,10 +200,10 @@ client.on("messageCreate", async message => {
   if (!matches) return;
 
   for (const possibleCode of matches) {
-    if (usedCodes.has(possibleCode)) continue;
+    if (db.usedCodes.includes(possibleCode)) continue;
 
     await message.reply(
-      `Possible Kingshot code detected: **${possibleCode}**\nCurrent mode: **${ashMode}**`
+      `Possible Kingshot code detected: **${possibleCode}**\nCurrent mode: **${db.mode}**`
     );
   }
 });
