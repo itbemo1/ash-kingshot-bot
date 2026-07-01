@@ -68,7 +68,6 @@ const commands = [
     .setName("usecode")
     .setDescription("Submit a Kingshot gift code.")
     .addStringOption(o => o.setName("code").setDescription("Gift code").setRequired(true))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
 ].map(c => c.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(token);
